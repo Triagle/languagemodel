@@ -14,7 +14,7 @@ from nltk.corpus import brown
 class BengioModel(keras.Model):
     ''' Model that replicates the architecture of Bengio et al.  '''
 
-    def __init__(self, window_size: int, vocabulary_size: int, embedding_size: int = 60, hidden_units: int = 50, regulariser_l=1e-4, use_linear=True):
+    def __init__(self, window_size: int, vocabulary_size: int, embedding_size: int = 60, hidden_units: int = 50, regulariser_l=1e-4, use_linear=True, dropout_rate=0.2):
         ''' Initialise model. 
 
         Args:
@@ -31,12 +31,18 @@ class BengioModel(keras.Model):
         self.vocabulary_size = vocabulary_size
         self.embedding_size = embedding_size
         self.use_linear = use_linear
+        # Improves generalisation of the model by adding dropout to the input (thus reducing the model's dependence on words)
+        self.dropout = layers.Dropout(
+            dropout_rate, noise_shape=(None, window_size, 1))
         # Takes the place of tanh(d + Hx)
         # You could easily chuck a few more layers here if you wanted to experiment with depth.
         # Not sure why the original paper uses the tanh function (legacy????). I would recommend substituting this with a relu.
-        self.non_linear = layers.Dense(hidden_units, activation=tf.nn.tanh)
+        self.non_linear = layers.Dense(hidden_units, activation=tf.nn.relu)
+        self.non_linear2 = layers.Dense(hidden_units, activation=tf.nn.relu)
+        self.non_linear3 = layers.Dense(hidden_units, activation=tf.nn.relu)
         # NOTE: Paper didn't specify if the embedding is regularised????
-        self.embedding = layers.Embedding(vocabulary_size, embedding_size)
+        self.embedding = layers.Embedding(
+            vocabulary_size, embedding_size, embeddings_regularizer=keras.regularizers.l2(l2=regulariser_l))
         self.W = layers.Dense(vocabulary_size, use_bias=False,
                               kernel_regularizer=keras.regularizers.l2(l2=regulariser_l))
         self.U = layers.Dense(vocabulary_size, use_bias=False,
@@ -44,12 +50,18 @@ class BengioModel(keras.Model):
         self.b = tf.Variable(tf.random.uniform(
             (vocabulary_size,), minval=-1, maxval=1))
 
-    def call(self, inputs):
-        embed = self.embedding(inputs)
+    def call(self, inputs, apply_dropout=True):
+        if apply_dropout:
+            drop_inputs = self.dropout(inputs)
+            embed = self.embedding(drop_inputs)
+        else:
+            embed = self.embedding(inputs)
         # The embedding output will be a tensor of shape (batch_size, self.window_size, self.embedding_size), i.e one embedding per word in the window
         # This reshape call concatenates all of the embeddings together.
         embed = tf.reshape(embed, (-1, self.embedding_size * self.window_size))
         act = self.non_linear(embed)
+        act = self.non_linear2(act)
+        act = self.non_linear3(act)
         non_linear = self.U(act)
         if self.use_linear:
             linear = self.W(embed)
@@ -91,10 +103,10 @@ def cross_entropy(y_true, y_pred):
 
 print(tf.config.list_physical_devices())
 WINDOW_SIZE = 6
-NUM_EPOCHS = 5
-EMBED_DIM = 30
+NUM_EPOCHS = 50
+EMBED_DIM = 60
 HIDDEN_DIM = 100
-BATCH_SIZE = 512
+BATCH_SIZE = 128
 SEED = 31415
 
 vocab_map, windows, labels = load_data('brown.txt', WINDOW_SIZE)
@@ -154,8 +166,9 @@ for epoch in range(NUM_EPOCHS):
         batch_windows = train_windows[i:i + BATCH_SIZE]
         batch_labels = train_labels[i:i + BATCH_SIZE]
         with tf.GradientTape() as tape:
-            out = model.call(batch_windows)
+            out = model.call(batch_windows, apply_dropout=False)
             loss = cross_entropy(batch_labels, out)
+            loss += sum(model.losses)
         v = model.trainable_variables
         gradients = tape.gradient(loss, v)
         optimiser.apply_gradients(zip(gradients, v))
@@ -165,14 +178,16 @@ for epoch in range(NUM_EPOCHS):
                 f'{epoch + 1}/{NUM_EPOCHS} loss: {loss_val:02.3f}, perplexity: {round(math.exp(loss_val)):04}')
 
     val_losses = np.zeros(
-        (val_windows.shape[0] // BATCH_SIZE + 1,), dtype=np.float)
+        (val_windows.shape[0] // BATCH_SIZE + 1,), dtype=float)
+    ce = 0
     for i in tqdm.trange(0, val_windows.shape[0], BATCH_SIZE):
         val_batch = val_windows[i: i + BATCH_SIZE]
         val_batch_labels = val_labels[i: i + BATCH_SIZE]
-        val_out = model.call(val_batch)
-        val_loss = cross_entropy(val_batch_labels, val_out)
-        val_losses[i // BATCH_SIZE] = val_loss.numpy()
-    mean_val_loss = val_losses.mean()
+        val_out = model.call(val_batch, apply_dropout=False)
+        val_loss = tf.reduce_sum(tf.losses.sparse_categorical_crossentropy(
+            val_batch_labels, val_out, from_logits=True))
+        ce += val_loss.numpy()
+    mean_val_loss = ce / val_windows.shape[0]
     mean_val_perplexity = np.round(np.exp(mean_val_loss))
     print(f'Epoch {epoch + 1}/{NUM_EPOCHS}, validation loss: {mean_val_loss:02.3f}, validation perplexity: {mean_val_perplexity:04}')
     checkpoint.save(os.path.join('chkpt', 'chkpt'))
